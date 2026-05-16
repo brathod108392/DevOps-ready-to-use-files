@@ -1,0 +1,38 @@
+Ubuntu kops installaion for k8s
+
+sudo apt update
+sudo snap install aws-cli --classic
+aws configure
+  id
+  password
+  region name
+  format
+ssh-kegen
+
+
+
+##Installing Kops
+curl -Lo kops https://github.com/kubernetes/kops/releases/download/$(curl -s https://api.github.com/repos/kubernetes/kops/releases/latest | grep tag_name | cut -d '"' -f 4)/kops-linux-amd64
+chmod +x kops
+sudo mv kops /usr/local/bin/kops
+
+
+##Installing Kubectl
+snap install kubectl --classic
+
+
+##creating kops cluster
+kops create cluster --name=kubepro.bkrinfo.xyz --state=s3://kubepro1189 --zones=us-east-1a,us-east-1b --node-count=2 --node-size=t3.small --control-planer-size=t3.small --dns-zone=kubepro.bkrinfo.xyz --node-volume-size=8 --control-plane-volume-size=8 --ssh-public-key ~/.ssh/id_xxxxxx.pub
+
+
+
+## Below command actually create a cluster
+kops update cluster --name=kubepro.bkrinfo.xyz --state-s3://kubepro1189 --yes --admin
+
+
+## It will validate the cluster
+kops validate cluster --name=kubepro.bkrinfo.xyz --state-s3://kubepro1189
+
+
+### It will delete the entire cluster
+kops delete cluster --name=kubepro.bkrinfo.xyz --state-s3://kubepro1189 --yes
