@@ -1,0 +1,908 @@
+===============================================================
+  KUBEADM + CALICO CNI — PRODUCTION-READY SETUP GUIDE
+  1 Master + 2 Worker Nodes | CentOS on AWS EC2
+===============================================================
+
+AWS ARCHITECTURE OVERVIEW
+--------------------------
+  - VPC with private subnets (nodes never get public IPs)
+  - Bastion host (jump box) for SSH access
+  - Security Groups replace firewalld rules
+  - IAM roles for EC2 instances (no access keys)
+  - S3 bucket for audit log shipping (optional)
+  - All nodes in the same Availability Zone (for local lab)
+    or spread across AZs for HA (advanced)
+
+RECOMMENDED EC2 INSTANCE TYPES
+--------------------------------
+Node        | Instance Type | vCPUs | RAM   | Storage
+------------|---------------|-------|-------|----------
+k8s-master  | t3.medium     |  2    | 4 GB  | 40 GB gp3
+k8s-worker1 | t3.medium     |  2    | 4 GB  | 40 GB gp3
+k8s-worker2 | t3.medium     |  2    | 4 GB  | 40 GB gp3
+bastion     | t3.micro      |  2    | 1 GB  | 8 GB gp3
+
+NOTE: t3.medium costs ~$0.0416/hr (~$30/month per node).
+      Stop instances when not in use to save cost.
+      Use t3a.medium for ~10% cheaper (AMD).
+
+OS: Amazon Linux 2023 or CentOS Stream 9 AMI
+    Recommended: Amazon Linux 2023 (maintained by AWS, SELinux-ready)
+
+NETWORK PLAN
+-------------
+VPC CIDR        : 10.0.0.0/16
+Private Subnet  : 10.0.1.0/24  (master + workers)
+Public Subnet   : 10.0.0.0/24  (bastion only)
+Pod Network     : 192.168.0.0/16 (Calico default — do NOT overlap with VPC)
+
+Node            | Private IP (example)
+----------------|---------------------
+k8s-master      | 10.0.1.10
+k8s-worker1     | 10.0.1.11
+k8s-worker2     | 10.0.1.12
+bastion         | 10.0.0.5 (public-facing)
+
+
+===============================================================
+  PHASE 0 — AWS INFRASTRUCTURE SETUP
+===============================================================
+
+NOTE: All steps below are done via AWS Console or AWS CLI.
+      Install AWS CLI: https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html
+      Configure: aws configure
+
+--------------------------------------------------------------
+  0.1 CREATE VPC AND SUBNETS
+--------------------------------------------------------------
+
+# Create VPC
+aws ec2 create-vpc --cidr-block 10.0.0.0/16 \
+  --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=k8s-vpc}]'
+
+# Note the VpcId from output (e.g. vpc-xxxxxxxxx)
+export VPC_ID=vpc-xxxxxxxxx
+
+# Create public subnet (for bastion)
+aws ec2 create-subnet --vpc-id $VPC_ID \
+  --cidr-block 10.0.0.0/24 \
+  --availability-zone us-east-1a \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=k8s-public}]'
+
+# Create private subnet (for k8s nodes)
+aws ec2 create-subnet --vpc-id $VPC_ID \
+  --cidr-block 10.0.1.0/24 \
+  --availability-zone us-east-1a \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=k8s-private}]'
+
+# Create and attach Internet Gateway (for bastion outbound)
+aws ec2 create-internet-gateway \
+  --tag-specifications 'ResourceType=internet-gateway,Tags=[{Key=Name,Value=k8s-igw}]'
+export IGW_ID=igw-xxxxxxxxx
+aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+
+# Create NAT Gateway (allows private nodes to pull packages outbound)
+# First allocate an Elastic IP:
+aws ec2 allocate-address --domain vpc
+export EIP_ALLOC=eipalloc-xxxxxxxxx
+
+# Create NAT Gateway in PUBLIC subnet:
+export PUBLIC_SUBNET_ID=subnet-xxxxxxxxx
+aws ec2 create-nat-gateway \
+  --subnet-id $PUBLIC_SUBNET_ID \
+  --allocation-id $EIP_ALLOC \
+  --tag-specifications 'ResourceType=natgateway,Tags=[{Key=Name,Value=k8s-nat}]'
+export NAT_GW_ID=nat-xxxxxxxxx
+
+# Route table for PUBLIC subnet -> IGW
+aws ec2 create-route-table --vpc-id $VPC_ID \
+  --tag-specifications 'ResourceType=route-table,Tags=[{Key=Name,Value=k8s-public-rt}]'
+export PUBLIC_RT=rtb-xxxxxxxxx
+aws ec2 create-route --route-table-id $PUBLIC_RT \
+  --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+aws ec2 associate-route-table --route-table-id $PUBLIC_RT --subnet-id $PUBLIC_SUBNET_ID
+
+# Route table for PRIVATE subnet -> NAT Gateway
+aws ec2 create-route-table --vpc-id $VPC_ID \
+  --tag-specifications 'ResourceType=route-table,Tags=[{Key=Name,Value=k8s-private-rt}]'
+export PRIVATE_RT=rtb-xxxxxxxxx
+export PRIVATE_SUBNET_ID=subnet-xxxxxxxxx
+aws ec2 create-route --route-table-id $PRIVATE_RT \
+  --destination-cidr-block 0.0.0.0/0 --nat-gateway-id $NAT_GW_ID
+aws ec2 associate-route-table --route-table-id $PRIVATE_RT --subnet-id $PRIVATE_SUBNET_ID
+
+--------------------------------------------------------------
+  0.2 CREATE SECURITY GROUPS (replaces firewalld)
+--------------------------------------------------------------
+
+NOTE: AWS Security Groups are stateful — return traffic is
+      automatically allowed. You only define inbound rules.
+
+# --- Bastion Security Group ---
+aws ec2 create-security-group \
+  --group-name k8s-bastion-sg \
+  --description "Bastion SSH access" \
+  --vpc-id $VPC_ID
+export BASTION_SG=sg-xxxxxxxxx
+
+# Allow SSH only from YOUR IP (replace with your actual public IP)
+aws ec2 authorize-security-group-ingress \
+  --group-id $BASTION_SG \
+  --protocol tcp --port 22 \
+  --cidr <YOUR_PUBLIC_IP>/32
+
+# --- Master Node Security Group ---
+aws ec2 create-security-group \
+  --group-name k8s-master-sg \
+  --description "Kubernetes master node" \
+  --vpc-id $VPC_ID
+export MASTER_SG=sg-xxxxxxxxx
+
+aws ec2 authorize-security-group-ingress --group-id $MASTER_SG --protocol tcp --port 22 --source-group $BASTION_SG   # SSH from bastion only
+aws ec2 authorize-security-group-ingress --group-id $MASTER_SG --protocol tcp --port 6443 --cidr 10.0.1.0/24        # API server (workers)
+aws ec2 authorize-security-group-ingress --group-id $MASTER_SG --protocol tcp --port 6443 --source-group $BASTION_SG # API server (kubectl from bastion)
+aws ec2 authorize-security-group-ingress --group-id $MASTER_SG --protocol tcp --port 2379 --cidr 10.0.1.0/24        # etcd client
+aws ec2 authorize-security-group-ingress --group-id $MASTER_SG --protocol tcp --port 2380 --cidr 10.0.1.0/24        # etcd peer
+aws ec2 authorize-security-group-ingress --group-id $MASTER_SG --protocol tcp --port 10250 --cidr 10.0.1.0/24       # kubelet API
+aws ec2 authorize-security-group-ingress --group-id $MASTER_SG --protocol tcp --port 10257 --cidr 10.0.1.0/24       # controller-manager
+aws ec2 authorize-security-group-ingress --group-id $MASTER_SG --protocol tcp --port 10259 --cidr 10.0.1.0/24       # scheduler
+aws ec2 authorize-security-group-ingress --group-id $MASTER_SG --protocol tcp --port 179 --cidr 10.0.1.0/24         # Calico BGP
+aws ec2 authorize-security-group-ingress --group-id $MASTER_SG --protocol udp --port 4789 --cidr 10.0.1.0/24        # Calico VXLAN
+aws ec2 authorize-security-group-ingress --group-id $MASTER_SG --protocol udp --port 51820 --cidr 10.0.1.0/24       # Calico WireGuard
+
+# --- Worker Node Security Group ---
+aws ec2 create-security-group \
+  --group-name k8s-worker-sg \
+  --description "Kubernetes worker nodes" \
+  --vpc-id $VPC_ID
+export WORKER_SG=sg-xxxxxxxxx
+
+aws ec2 authorize-security-group-ingress --group-id $WORKER_SG --protocol tcp --port 22 --source-group $BASTION_SG    # SSH from bastion only
+aws ec2 authorize-security-group-ingress --group-id $WORKER_SG --protocol tcp --port 10250 --cidr 10.0.1.0/24         # kubelet API
+aws ec2 authorize-security-group-ingress --group-id $WORKER_SG --protocol tcp --port 10256 --cidr 10.0.1.0/24         # kube-proxy health
+aws ec2 authorize-security-group-ingress --group-id $WORKER_SG --protocol tcp --port 30000-32767 --cidr 10.0.0.0/16   # NodePort services
+aws ec2 authorize-security-group-ingress --group-id $WORKER_SG --protocol tcp --port 179 --cidr 10.0.1.0/24           # Calico BGP
+aws ec2 authorize-security-group-ingress --group-id $WORKER_SG --protocol udp --port 4789 --cidr 10.0.1.0/24          # Calico VXLAN
+aws ec2 authorize-security-group-ingress --group-id $WORKER_SG --protocol udp --port 51820 --cidr 10.0.1.0/24         # Calico WireGuard
+
+--------------------------------------------------------------
+  0.3 CREATE IAM ROLE FOR EC2 INSTANCES [SECURITY IMPROVEMENT]
+--------------------------------------------------------------
+
+# Never use access keys on EC2. Attach an IAM role instead.
+# This allows nodes to call AWS APIs (e.g. for EBS volumes, ECR) securely.
+
+# Create trust policy file:
+cat > ec2-trust-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "ec2.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}
+EOF
+
+# Create the IAM role:
+aws iam create-role \
+  --role-name k8s-node-role \
+  --assume-role-policy-document file://ec2-trust-policy.json
+
+# Attach minimal required policies:
+aws iam attach-role-policy --role-name k8s-node-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+aws iam attach-role-policy --role-name k8s-node-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonECRReadOnly
+
+# Create instance profile and attach role:
+aws iam create-instance-profile --instance-profile-name k8s-node-profile
+aws iam add-role-to-instance-profile \
+  --instance-profile-name k8s-node-profile \
+  --role-name k8s-node-role
+
+--------------------------------------------------------------
+  0.4 CREATE KEY PAIR FOR SSH
+--------------------------------------------------------------
+
+aws ec2 create-key-pair \
+  --key-name k8s-keypair \
+  --query 'KeyMaterial' \
+  --output text > k8s-keypair.pem
+
+chmod 400 k8s-keypair.pem
+
+IMPORTANT: Store k8s-keypair.pem securely. Never commit to Git.
+           Use AWS Secrets Manager or a password manager.
+
+--------------------------------------------------------------
+  0.5 LAUNCH EC2 INSTANCES
+--------------------------------------------------------------
+
+# Get the latest Amazon Linux 2023 AMI ID:
+aws ec2 describe-images \
+  --owners amazon \
+  --filters "Name=name,Values=al2023-ami-*-x86_64" \
+  --query 'sort_by(Images,&CreationDate)[-1].ImageId' \
+  --output text
+export AMI_ID=ami-xxxxxxxxx
+
+# Launch Bastion (public subnet, public IP enabled)
+aws ec2 run-instances \
+  --image-id $AMI_ID \
+  --instance-type t3.micro \
+  --key-name k8s-keypair \
+  --subnet-id $PUBLIC_SUBNET_ID \
+  --security-group-ids $BASTION_SG \
+  --associate-public-ip-address \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=bastion}]'
+
+# Launch Master (private subnet, NO public IP)
+aws ec2 run-instances \
+  --image-id $AMI_ID \
+  --instance-type t3.medium \
+  --key-name k8s-keypair \
+  --subnet-id $PRIVATE_SUBNET_ID \
+  --security-group-ids $MASTER_SG \
+  --iam-instance-profile Name=k8s-node-profile \
+  --no-associate-public-ip-address \
+  --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":40,"VolumeType":"gp3","Encrypted":true}}]' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=k8s-master},{Key=Role,Value=master}]'
+
+# Launch Worker 1
+aws ec2 run-instances \
+  --image-id $AMI_ID \
+  --instance-type t3.medium \
+  --key-name k8s-keypair \
+  --subnet-id $PRIVATE_SUBNET_ID \
+  --security-group-ids $WORKER_SG \
+  --iam-instance-profile Name=k8s-node-profile \
+  --no-associate-public-ip-address \
+  --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":40,"VolumeType":"gp3","Encrypted":true}}]' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=k8s-worker1},{Key=Role,Value=worker}]'
+
+# Launch Worker 2
+aws ec2 run-instances \
+  --image-id $AMI_ID \
+  --instance-type t3.medium \
+  --key-name k8s-keypair \
+  --subnet-id $PRIVATE_SUBNET_ID \
+  --security-group-ids $WORKER_SG \
+  --iam-instance-profile Name=k8s-node-profile \
+  --no-associate-public-ip-address \
+  --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":40,"VolumeType":"gp3","Encrypted":true}}]' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=k8s-worker2},{Key=Role,Value=worker}]'
+
+NOTE: EBS volumes are encrypted at rest (--encrypted flag above).
+      This replaces the manual etcd encryption config for the OS layer.
+
+--------------------------------------------------------------
+  0.6 SSH ACCESS VIA BASTION (Jump Box)
+--------------------------------------------------------------
+
+# Get bastion public IP:
+aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=bastion" \
+  --query 'Reservations[*].Instances[*].PublicIpAddress' \
+  --output text
+export BASTION_IP=x.x.x.x
+
+# Get private IPs of k8s nodes:
+aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=k8s-master" \
+  --query 'Reservations[*].Instances[*].PrivateIpAddress' \
+  --output text
+export MASTER_IP=10.0.1.10   # replace with actual
+
+# SSH to master via bastion (SSH agent forwarding):
+ssh-add k8s-keypair.pem
+ssh -A -J ec2-user@$BASTION_IP ec2-user@$MASTER_IP
+
+# OR configure ~/.ssh/config for convenience:
+cat >> ~/.ssh/config <<EOF
+
+Host bastion
+  HostName $BASTION_IP
+  User ec2-user
+  IdentityFile ~/k8s-keypair.pem
+
+Host k8s-master
+  HostName 10.0.1.10
+  User ec2-user
+  ProxyJump bastion
+
+Host k8s-worker1
+  HostName 10.0.1.11
+  User ec2-user
+  ProxyJump bastion
+
+Host k8s-worker2
+  HostName 10.0.1.12
+  User ec2-user
+  ProxyJump bastion
+EOF
+
+# Then simply:
+ssh k8s-master
+ssh k8s-worker1
+ssh k8s-worker2
+
+--------------------------------------------------------------
+  0.7 SET HOSTNAMES (ALL 3 NODES via SSH)
+--------------------------------------------------------------
+
+# On master:
+sudo hostnamectl set-hostname k8s-master
+
+# On worker1:
+sudo hostnamectl set-hostname k8s-worker1
+
+# On worker2:
+sudo hostnamectl set-hostname k8s-worker2
+
+# Add /etc/hosts entries on ALL 3 nodes (use actual private IPs):
+sudo tee -a /etc/hosts <<EOF
+10.0.1.10   k8s-master
+10.0.1.11   k8s-worker1
+10.0.1.12   k8s-worker2
+EOF
+
+
+===============================================================
+  PHASE 1 — PREREQUISITES (ALL 3 NODES)
+===============================================================
+
+# 1.1 Disable Swap (Amazon Linux 2023 has no swap by default — verify)
+free -h
+# If swap shows 0, skip. Otherwise:
+sudo swapoff -a
+sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+# 1.2 Keep SELinux in Enforcing mode [SECURITY IMPROVEMENT]
+# Amazon Linux 2023 ships with SELinux in permissive by default.
+# Enable enforcing mode:
+sudo sed -i 's/^SELINUX=permissive$/SELINUX=enforcing/' /etc/selinux/config
+sudo setenforce 1
+
+# Install container SELinux policy:
+sudo dnf install -y container-selinux
+
+# Verify:
+getenforce
+# Should print: Enforcing
+
+# NOTE: To inspect SELinux denials later:
+# sudo ausearch -m avc -ts recent | audit2why
+
+# 1.3 Firewall on AWS [AWS-SPECIFIC]
+# AWS Security Groups (configured in Phase 0.2) handle network-level
+# filtering — they are the AWS equivalent of firewalld rules.
+# Amazon Linux 2023 has firewalld disabled by default — leave it off.
+# Do NOT re-enable it; it conflicts with iptables rules that
+# kubeadm and Calico manage internally.
+
+# Verify firewalld is not running:
+sudo systemctl status firewalld
+# Should show: inactive (dead) — this is correct on AWS.
+
+# 1.4 Load Kernel Modules (ALL 3 NODES)
+cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+
+sudo modprobe overlay
+sudo modprobe br_netfilter
+
+# 1.5 Set Kernel Parameters (ALL 3 NODES)
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+
+sudo sysctl --system
+
+# Verify (both should return = 1):
+sysctl net.bridge.bridge-nf-call-iptables net.ipv4.ip_forward
+
+# 1.6 SSH is already key-only on AWS EC2 [SECURITY — already handled]
+# AWS EC2 disables password authentication by default.
+# Root login is disabled by default.
+# Verify:
+sudo grep PasswordAuthentication /etc/ssh/sshd_config
+sudo grep PermitRootLogin /etc/ssh/sshd_config
+
+# 1.7 System Updates [SECURITY IMPROVEMENT — ALL 3 NODES]
+sudo dnf update -y
+sudo dnf install -y dnf-automatic
+sudo sed -i 's/apply_updates = no/apply_updates = yes/' /etc/dnf/automatic.conf
+sudo systemctl enable --now dnf-automatic.timer
+
+# 1.8 Install AWS SSM Agent (enables shell access without SSH) [AWS IMPROVEMENT]
+# Amazon Linux 2023 has SSM Agent pre-installed. Verify and enable:
+sudo systemctl enable --now amazon-ssm-agent
+sudo systemctl status amazon-ssm-agent
+# With SSM, you can access instances via AWS Console without opening port 22.
+# This lets you remove SSH entirely from Security Groups for extra hardening.
+
+
+===============================================================
+  PHASE 2 — INSTALL CONTAINERD RUNTIME (ALL 3 NODES)
+===============================================================
+
+# Add Docker repo (containerd source)
+sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+sudo dnf install -y containerd.io
+
+# Generate default config
+sudo mkdir -p /etc/containerd
+sudo containerd config default | sudo tee /etc/containerd/config.toml
+
+# CRITICAL: Enable SystemdCgroup (required for kubeadm)
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+# Enable and start containerd
+sudo systemctl enable --now containerd
+sudo systemctl status containerd
+
+
+===============================================================
+  PHASE 3 — INSTALL KUBEADM, KUBELET, KUBECTL (ALL 3 NODES)
+===============================================================
+
+# 3.1 Add Kubernetes repo
+cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/v1.29/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/v1.29/rpm/repodata/repomd.xml.key
+exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+EOF
+
+NOTE: Replace v1.29 with latest stable version if needed (e.g. v1.30, v1.31)
+
+# 3.2 Install packages
+sudo dnf install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+sudo systemctl enable --now kubelet
+
+NOTE: kubelet will be in a crash-loop here — this is EXPECTED until kubeadm init runs.
+
+# 3.3 Lock versions to prevent accidental upgrades [SECURITY IMPROVEMENT]
+sudo dnf install -y 'dnf-command(versionlock)'
+sudo dnf versionlock kubelet kubeadm kubectl
+
+
+===============================================================
+  PHASE 4 — INITIALIZE CONTROL PLANE (MASTER ONLY)
+===============================================================
+
+# On AWS, use the private IP of the master node.
+# The --apiserver-advertise-address must be the EC2 private IP.
+
+sudo kubeadm init \
+  --pod-network-cidr=192.168.0.0/16 \
+  --apiserver-advertise-address=10.0.1.10 \
+  --node-name=k8s-master \
+  --cri-socket=unix:///var/run/containerd/containerd.sock
+
+IMPORTANT: --pod-network-cidr=192.168.0.0/16 is Calico's default.
+           Do NOT change it or overlap it with your VPC CIDR (10.0.0.0/16).
+
+# 4.1 Configure kubectl
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# Restrict kubeconfig permissions [SECURITY IMPROVEMENT]
+chmod 600 $HOME/.kube/config
+
+# 4.2 SAVE THE JOIN COMMAND from kubeadm init output!
+# It looks like:
+#   kubeadm join 10.0.1.10:6443 --token <token> \
+#     --discovery-token-ca-cert-hash sha256:<hash>
+
+# Use a short-lived token for joining (expires in 1h) [SECURITY IMPROVEMENT]
+kubeadm token create --ttl 1h --print-join-command
+
+# Or regenerate the default 24h token anytime:
+kubeadm token create --print-join-command
+
+# 4.3 Copy kubeconfig to bastion for remote kubectl access [AWS-SPECIFIC]
+# Run from your LOCAL machine:
+scp -o ProxyJump=ec2-user@$BASTION_IP \
+    ec2-user@10.0.1.10:~/.kube/config \
+    ~/.kube/k8s-aws-config
+
+# Set KUBECONFIG to use it:
+export KUBECONFIG=~/.kube/k8s-aws-config
+kubectl get nodes
+
+
+===============================================================
+  PHASE 5 — INSTALL CALICO CNI (MASTER ONLY)
+===============================================================
+
+# Install Calico operator
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
+
+# Install Calico custom resources
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
+
+NOTE: Check https://github.com/projectcalico/calico/releases for the latest version.
+      Replace v3.27.0 with latest if needed.
+
+# Wait for Calico pods to be Running before joining workers:
+watch kubectl get pods -n calico-system
+
+
+===============================================================
+  PHASE 6 — JOIN WORKER NODES (WORKER1 AND WORKER2)
+===============================================================
+
+# SSH into each worker via bastion and run the join command:
+sudo kubeadm join 10.0.1.10:6443 --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash>
+
+
+===============================================================
+  PHASE 7 — VERIFY CLUSTER HEALTH (MASTER)
+===============================================================
+
+# All nodes should show STATUS = Ready
+kubectl get nodes -o wide
+
+# All pods should be Running
+kubectl get pods -A
+
+# Calico specifically
+kubectl get pods -n calico-system
+
+Expected output:
+  NAME           STATUS   ROLES           AGE   VERSION
+  k8s-master     Ready    control-plane   10m   v1.29.x
+  k8s-worker1    Ready    <none>          5m    v1.29.x
+  k8s-worker2    Ready    <none>          5m    v1.29.x
+
+
+===============================================================
+  PHASE 8 — PRODUCTION HARDENING & SECURITY
+===============================================================
+
+# 8.1 Label worker nodes properly
+kubectl label node k8s-worker1 node-role.kubernetes.io/worker=worker
+kubectl label node k8s-worker2 node-role.kubernetes.io/worker=worker
+
+# 8.2 Verify etcd health
+kubectl get pods -n kube-system | grep etcd
+
+# 8.3 Check component statuses
+kubectl get componentstatuses
+
+# 8.4 Enable audit logging
+# Edit: /etc/kubernetes/manifests/kube-apiserver.yaml
+# Add these flags under spec.containers.command:
+#   --audit-log-path=/var/log/kubernetes/audit.log
+#   --audit-log-maxage=30
+#   --audit-log-maxbackup=10
+#   --audit-log-maxsize=100
+
+# 8.5 Apply default deny-all NetworkPolicy [SECURITY IMPROVEMENT]
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+EOF
+
+NOTE: Apply this to each namespace you create, then add
+      explicit allow policies per application.
+
+# 8.6 Disable anonymous API access [SECURITY IMPROVEMENT]
+# Edit /etc/kubernetes/manifests/kube-apiserver.yaml
+# Ensure this flag exists:
+#   --anonymous-auth=false
+
+# 8.7 Enable Pod Security Admission [SECURITY IMPROVEMENT]
+kubectl label namespace default pod-security.kubernetes.io/enforce=baseline
+kubectl label namespace default pod-security.kubernetes.io/warn=restricted
+kubectl label namespace default pod-security.kubernetes.io/audit=restricted
+
+# Levels:
+#   privileged = unrestricted (avoid in production)
+#   baseline   = blocks privilege escalation (minimum recommended)
+#   restricted = fully hardened (best practice)
+
+# 8.8 etcd encryption at rest [AWS NOTE]
+# EBS volumes are already encrypted at the disk level (--encrypted flag
+# in Phase 0.5). For application-layer encryption of K8s Secrets in etcd,
+# apply this additional config on master:
+
+cat <<EOF | sudo tee /etc/kubernetes/encryption-config.yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+    providers:
+      - aescbc:
+          keys:
+            - name: key1
+              secret: $(head -c 32 /dev/urandom | base64)
+      - identity: {}
+EOF
+
+# Then add to /etc/kubernetes/manifests/kube-apiserver.yaml:
+#   --encryption-provider-config=/etc/kubernetes/encryption-config.yaml
+
+# 8.9 Verify etcd is bound to private IP only (not 0.0.0.0)
+grep "listen-client-urls" /etc/kubernetes/manifests/etcd.yaml
+# Should show: https://127.0.0.1:2379 and https://10.0.1.10:2379
+
+# 8.10 Audit RBAC — no cluster-admin for apps [SECURITY IMPROVEMENT]
+kubectl get clusterrolebindings -o wide | grep cluster-admin
+
+# 8.11 Monitor certificate expiry [SECURITY IMPROVEMENT]
+kubeadm certs check-expiration
+# To renew:
+sudo kubeadm certs renew all
+
+# 8.12 Enable AWS CloudTrail for API auditing [AWS-SPECIFIC SECURITY]
+# CloudTrail logs all AWS API calls (EC2, IAM, VPC changes).
+# Enable via AWS Console: CloudTrail -> Create Trail -> All regions.
+# Store logs in an S3 bucket with:
+#   - Server-side encryption (SSE-S3 or SSE-KMS)
+#   - MFA delete enabled on the bucket
+#   - CloudTrail log file validation enabled
+
+# 8.13 Enable AWS GuardDuty [AWS-SPECIFIC SECURITY]
+# GuardDuty detects threats like cryptocurrency mining, unusual API calls,
+# and compromised EC2 instances automatically.
+# Enable via AWS Console: GuardDuty -> Enable GuardDuty.
+# Cost: ~$1-3/month for this cluster size.
+
+# 8.14 Enable VPC Flow Logs [AWS-SPECIFIC SECURITY]
+aws ec2 create-flow-logs \
+  --resource-type VPC \
+  --resource-ids $VPC_ID \
+  --traffic-type ALL \
+  --log-destination-type cloud-watch-logs \
+  --log-group-name /aws/vpc/k8s-flowlogs \
+  --deliver-logs-permission-arn arn:aws:iam::<ACCOUNT_ID>:role/FlowLogsRole
+
+# VPC Flow Logs capture all accepted/rejected traffic at the ENI level.
+# Useful for debugging network issues and detecting anomalous traffic.
+
+# 8.15 Use AWS KMS for Secret Encryption (advanced) [AWS IMPROVEMENT]
+# Instead of a static AES key (Phase 8.8), use AWS KMS for key management.
+# This allows automatic key rotation and audit trail in CloudTrail.
+# Requires the KMS provider plugin for Kubernetes:
+# https://kubernetes.io/docs/tasks/administer-cluster/kms-provider/
+
+
+===============================================================
+  PHASE 9 — ONGOING SECURITY MONITORING
+===============================================================
+
+# 9.1 Install kube-bench (CIS Kubernetes Benchmark)
+curl -L https://github.com/aquasecurity/kube-bench/releases/latest/download/kube-bench_linux_amd64.tar.gz \
+  | tar -xz
+./kube-bench run --targets master          # Run on master
+./kube-bench run --targets node            # Run on each worker
+
+# 9.2 Monitor audit logs for delete events
+sudo tail -f /var/log/kubernetes/audit.log | grep '"verb":"delete"'
+
+# 9.3 Check for privileged pods (should return nothing in hardened cluster)
+kubectl get pods -A -o jsonpath=\
+'{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[*].securityContext.privileged}{"\n"}{end}' \
+  | grep true
+
+# 9.4 Watch for unauthorized API access attempts
+journalctl -u kube-apiserver | grep "Forbidden\|Unauthorized" | tail -20
+
+# 9.5 AWS Cost Control — stop instances when not in use
+# Stop all k8s instances (keeps EBS, loses RAM state):
+aws ec2 stop-instances --instance-ids <master-id> <worker1-id> <worker2-id>
+
+# Start when needed:
+aws ec2 start-instances --instance-ids <master-id> <worker1-id> <worker2-id>
+
+# Set a billing alarm to avoid surprise costs:
+aws cloudwatch put-metric-alarm \
+  --alarm-name k8s-billing-alarm \
+  --alarm-description "Alert if monthly bill exceeds $50" \
+  --metric-name EstimatedCharges \
+  --namespace AWS/Billing \
+  --statistic Maximum \
+  --period 86400 \
+  --threshold 50 \
+  --comparison-operator GreaterThanThreshold \
+  --dimensions Name=Currency,Value=USD \
+  --evaluation-periods 1 \
+  --alarm-actions arn:aws:sns:<region>:<account-id>:<your-sns-topic>
+
+
+===============================================================
+  TROUBLESHOOTING REFERENCE
+===============================================================
+
+Problem                          | Fix
+---------------------------------|----------------------------------------------
+Nodes show NotReady              | Calico not ready yet — wait 2-3 mins
+kubelet won't start              | journalctl -u kubelet -f (swap or cgroup issue)
+kubeadm init fails on preflight  | sudo kubeadm init --ignore-preflight-errors=all
+Workers can't join               | Check Security Group rules, port 6443, token expiry
+Pods stuck in ContainerCreating  | Calico not done — kubectl describe pod <name>
+Cross-node pod traffic fails     | Check Security Group — port 4789/udp open between nodes?
+Cannot SSH to nodes              | SSH via bastion only — nodes have no public IP
+Nodes unreachable after reboot   | Private IPs may change — use Elastic IPs or Route53
+SELinux blocking containerd      | sudo ausearch -m avc -ts recent | audit2why
+Permission denied on kubeconfig  | chmod 600 ~/.kube/config
+NAT Gateway not routing          | Check private subnet route table -> NAT Gateway
+
+
+===============================================================
+  AWS SECURITY GROUP RULES SUMMARY
+===============================================================
+
+BASTION SECURITY GROUP
+----------------------
+Port 22/tcp   | Source: <YOUR_IP>/32  | SSH from your machine only
+
+MASTER SECURITY GROUP
+---------------------
+Port 22/tcp         | Source: Bastion SG    | SSH from bastion only
+Port 6443/tcp       | Source: 10.0.1.0/24   | API server (workers)
+Port 6443/tcp       | Source: Bastion SG    | kubectl from bastion
+Port 2379-2380/tcp  | Source: 10.0.1.0/24   | etcd
+Port 10250/tcp      | Source: 10.0.1.0/24   | kubelet API
+Port 10257/tcp      | Source: 10.0.1.0/24   | controller-manager
+Port 10259/tcp      | Source: 10.0.1.0/24   | scheduler
+Port 179/tcp        | Source: 10.0.1.0/24   | Calico BGP
+Port 4789/udp       | Source: 10.0.1.0/24   | Calico VXLAN
+Port 51820/udp      | Source: 10.0.1.0/24   | Calico WireGuard
+
+WORKER SECURITY GROUP
+---------------------
+Port 22/tcp          | Source: Bastion SG   | SSH from bastion only
+Port 10250/tcp       | Source: 10.0.1.0/24  | kubelet API
+Port 10256/tcp       | Source: 10.0.1.0/24  | kube-proxy health
+Port 30000-32767/tcp | Source: 10.0.0.0/16  | NodePort services
+Port 179/tcp         | Source: 10.0.1.0/24  | Calico BGP
+Port 4789/udp        | Source: 10.0.1.0/24  | Calico VXLAN
+Port 51820/udp       | Source: 10.0.1.0/24  | Calico WireGuard
+
+KEY DIFFERENCE FROM LOCAL VM:
+Security Groups are stateful — no need to configure masquerade
+or return traffic rules. Inbound rules only.
+
+
+===============================================================
+  ESTIMATED AWS COSTS
+===============================================================
+
+Resource                  | Cost/hr     | Cost/month (24x7)
+--------------------------|-------------|-------------------
+t3.medium x3 (k8s nodes) | $0.0416 x3  | ~$90
+t3.micro x1 (bastion)    | $0.0104     | ~$7.50
+EBS gp3 40GB x3          | -           | ~$9.60
+EBS gp3 8GB x1 (bastion) | -           | ~$0.64
+NAT Gateway               | $0.045/hr   | ~$32
+NAT Data Transfer         | $0.045/GB   | varies
+                          |             |
+TOTAL ESTIMATE            |             | ~$140-150/month
+
+COST SAVING TIPS:
+- Stop instances when not in use (saves ~65% if used 8hr/day)
+- Use Spot Instances for workers (~70% cheaper, may be interrupted)
+- Delete NAT Gateway when not using cluster (recreate when needed)
+- Set a CloudWatch billing alarm (Phase 9.5)
+
+
+===============================================================
+  QUICK REFERENCE COMMANDS
+===============================================================
+
+# Check node status
+kubectl get nodes -o wide
+
+# Check all pods
+kubectl get pods -A
+
+# Check cluster info
+kubectl cluster-info
+
+# Regenerate join token
+kubeadm token create --print-join-command
+
+# Reset a node (start over)
+sudo kubeadm reset && sudo rm -rf /etc/kubernetes ~/.kube /var/lib/etcd
+
+# View kubelet logs
+journalctl -u kubelet -f
+
+# View containerd status
+sudo systemctl status containerd
+
+# Check certificate expiry
+sudo kubeadm certs check-expiration
+
+# Check NetworkPolicies
+kubectl get networkpolicy -A
+
+# Check RBAC bindings
+kubectl get clusterrolebindings -o wide
+
+# Run CIS benchmark
+./kube-bench run --targets master
+
+# SSH to master via bastion
+ssh k8s-master
+
+# Stop all k8s EC2 instances
+aws ec2 stop-instances --instance-ids <master-id> <worker1-id> <worker2-id>
+
+
+===============================================================
+  WHAT CHANGED FROM LOCAL VM VERSION
+===============================================================
+
+Topic                    | Local VM                    | AWS Version
+-------------------------|-----------------------------|---------------------------------
+Infrastructure           | Manual VM creation          | EC2 via AWS CLI / Console
+Networking               | Host-only / NAT adapter     | VPC with public + private subnets
+SSH access               | Direct SSH to nodes         | SSH via bastion jump box
+Firewall                 | firewalld rules             | AWS Security Groups (no firewalld)
+Node IPs                 | Static 192.168.56.x         | Private 10.0.1.x via VPC
+Public IPs               | Host NAT                    | NAT Gateway for outbound only
+Disk encryption          | Manual etcd encryption      | EBS encrypted volumes + etcd layer
+IAM / Access control     | N/A                         | IAM roles on EC2 (no access keys)
+Audit logging            | Local audit log file        | Local + ship to CloudTrail / S3
+Threat detection         | kube-bench only             | GuardDuty + kube-bench
+Network flow logs        | Not available               | VPC Flow Logs
+Cost management          | Electricity only            | Pay-per-use + billing alarms
+SELinux                  | Enforcing (CentOS default)  | Must manually enable on AL2023
+
+
+===============================================================
+  SECURITY IMPROVEMENTS SUMMARY
+===============================================================
+
+Improvement                     | Why It Matters
+--------------------------------|----------------------------------------------
+Private subnet for k8s nodes    | Nodes have no public IP — not directly reachable
+Bastion jump box                | Single controlled SSH entry point
+Security Groups (not firewalld) | AWS-managed stateful firewall at VPC level
+IAM role on EC2 (no keys)       | No long-lived credentials on instances
+EBS encrypted volumes           | Disk-level encryption out of the box
+SELinux Enforcing               | Mandatory access control on Amazon Linux
+SSH key-only (AWS default)      | Password auth disabled by default on EC2
+SSM Agent enabled               | Shell access without port 22 if needed
+Version lock kubeadm/kubelet    | Prevent accidental breaking upgrades
+chmod 600 on kubeconfig         | Prevent other OS users reading cluster creds
+Short-lived join tokens (1h)    | Reduces window for stolen token abuse
+Default deny NetworkPolicy      | Zero-trust pod-to-pod communication
+anonymous-auth=false            | Block unauthenticated API server access
+Pod Security Admission          | Enforce hardened pod standards per namespace
+etcd encryption at rest         | App-level secret encryption in etcd
+RBAC audit (no cluster-admin)   | Prevent over-privileged service accounts
+AWS CloudTrail                  | Full audit trail of all AWS API calls
+AWS GuardDuty                   | Automated threat detection for the account
+VPC Flow Logs                   | Network traffic visibility and anomaly detection
+Billing alarm                   | Prevent runaway cloud costs
+kube-bench CIS scanning         | Continuous compliance and audit readiness
+Certificate expiry monitoring   | Prevent cluster lockout on cert expiry
+
+
+===============================================================
+  END OF GUIDE
+===============================================================
