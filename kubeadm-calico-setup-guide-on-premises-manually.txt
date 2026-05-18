@@ -1,0 +1,267 @@
+===============================================================
+  KUBEADM + CALICO CNI — PRODUCTION-READY SETUP GUIDE
+  1 Master + 2 Worker Nodes | CentOS | Local VM
+===============================================================
+
+HOST MACHINE SPECS
+------------------
+CPU     : Intel Core i5-6400T @ 2.20GHz
+RAM     : 24.0 GB
+Storage : 932 GB SSD
+OS      : Windows 10/11, 64-bit
+
+RECOMMENDED VM ALLOCATION
+--------------------------
+Node        | vCPUs | RAM  | Disk
+------------|-------|------|------
+k8s-master  |  2    | 4 GB | 40 GB
+k8s-worker1 |  2    | 4 GB | 40 GB
+k8s-worker2 |  2    | 4 GB | 40 GB
+
+VM IP PLAN (adjust to your network)
+-------------------------------------
+k8s-master   -> 192.168.56.10
+k8s-worker1  -> 192.168.56.11
+k8s-worker2  -> 192.168.56.12
+
+
+===============================================================
+  PHASE 0 — VM SETUP (ALL 3 NODES)
+===============================================================
+
+# Set hostnames
+# On master:
+hostnamectl set-hostname k8s-master
+
+# On worker1:
+hostnamectl set-hostname k8s-worker1
+
+# On worker2:
+hostnamectl set-hostname k8s-worker2
+
+# Add /etc/hosts entries on ALL 3 nodes:
+cat >> /etc/hosts <<EOF
+192.168.56.10   k8s-master
+192.168.56.11   k8s-worker1
+192.168.56.12   k8s-worker2
+EOF
+
+
+===============================================================
+  PHASE 1 — PREREQUISITES (ALL 3 NODES)
+===============================================================
+
+# 1.1 Disable Swap
+swapoff -a
+sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+# 1.2 Disable SELinux (set to permissive)
+setenforce 0
+sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+
+# 1.3 Disable Firewalld
+systemctl disable --now firewalld
+
+# 1.4 Load Kernel Modules
+cat <<EOF | tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+
+modprobe overlay
+modprobe br_netfilter
+
+# 1.5 Set Kernel Parameters
+cat <<EOF | tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+
+sysctl --system
+
+# Verify (both should return = 1):
+sysctl net.bridge.bridge-nf-call-iptables net.ipv4.ip_forward
+
+
+===============================================================
+  PHASE 2 — INSTALL CONTAINERD RUNTIME (ALL 3 NODES)
+===============================================================
+
+# Add Docker repo (containerd source)
+dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+dnf install -y containerd.io
+
+# Generate default config
+mkdir -p /etc/containerd
+containerd config default | tee /etc/containerd/config.toml
+
+# CRITICAL: Enable SystemdCgroup (required for kubeadm)
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+# Enable and start containerd
+systemctl enable --now containerd
+systemctl status containerd
+
+
+===============================================================
+  PHASE 3 — INSTALL KUBEADM, KUBELET, KUBECTL (ALL 3 NODES)
+===============================================================
+
+# 3.1 Add Kubernetes repo
+cat <<EOF | tee /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/v1.29/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/v1.29/rpm/repodata/repomd.xml.key
+exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+EOF
+
+NOTE: Replace v1.29 with latest stable version if needed (e.g. v1.30, v1.31)
+
+# 3.2 Install packages
+dnf install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+systemctl enable --now kubelet
+
+NOTE: kubelet will be in a crash-loop here — this is EXPECTED until kubeadm init runs.
+
+
+===============================================================
+  PHASE 4 — INITIALIZE CONTROL PLANE (MASTER ONLY)
+===============================================================
+
+kubeadm init \
+  --pod-network-cidr=192.168.0.0/16 \
+  --apiserver-advertise-address=192.168.56.10 \
+  --node-name=k8s-master \
+  --cri-socket=unix:///var/run/containerd/containerd.sock
+
+IMPORTANT: --pod-network-cidr=192.168.0.0/16 is Calico's default. Do NOT change it.
+
+# 4.1 Configure kubectl for master
+mkdir -p $HOME/.kube
+cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+chown $(id -u):$(id -g) $HOME/.kube/config
+
+# 4.2 SAVE THE JOIN COMMAND shown at the end of kubeadm init output!
+# It looks like:
+#   kubeadm join 192.168.56.10:6443 --token <token> \
+#     --discovery-token-ca-cert-hash sha256:<hash>
+
+# If you lose it, regenerate anytime with:
+kubeadm token create --print-join-command
+
+
+===============================================================
+  PHASE 5 — INSTALL CALICO CNI (MASTER ONLY)
+===============================================================
+
+# Install Calico operator
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
+
+# Install Calico custom resources
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
+
+NOTE: Check https://github.com/projectcalico/calico/releases for the latest version.
+      Replace v3.27.0 above with latest if needed.
+
+# Wait for Calico pods to be Running before joining workers:
+watch kubectl get pods -n calico-system
+
+
+===============================================================
+  PHASE 6 — JOIN WORKER NODES (WORKER1 AND WORKER2)
+===============================================================
+
+# Run the join command saved from Phase 4 on BOTH workers:
+kubeadm join 192.168.56.10:6443 --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash>
+
+
+===============================================================
+  PHASE 7 — VERIFY CLUSTER HEALTH (MASTER)
+===============================================================
+
+# All nodes should show STATUS = Ready
+kubectl get nodes -o wide
+
+# All pods should be Running
+kubectl get pods -A
+
+# Calico specifically
+kubectl get pods -n calico-system
+
+Expected output:
+  NAME           STATUS   ROLES           AGE   VERSION
+  k8s-master     Ready    control-plane   10m   v1.29.x
+  k8s-worker1    Ready    <none>          5m    v1.29.x
+  k8s-worker2    Ready    <none>          5m    v1.29.x
+
+
+===============================================================
+  PHASE 8 — PRODUCTION HARDENING
+===============================================================
+
+# Label worker nodes properly
+kubectl label node k8s-worker1 node-role.kubernetes.io/worker=worker
+kubectl label node k8s-worker2 node-role.kubernetes.io/worker=worker
+
+# Verify etcd health
+kubectl get pods -n kube-system | grep etcd
+
+# Check component statuses
+kubectl get componentstatuses
+
+# Enable audit logging — edit the API server manifest:
+# File: /etc/kubernetes/manifests/kube-apiserver.yaml
+# Add these flags:
+#   --audit-log-path=/var/log/kubernetes/audit.log
+#   --audit-log-maxage=30
+#   --audit-log-maxbackup=10
+#   --audit-log-maxsize=100
+
+
+===============================================================
+  TROUBLESHOOTING REFERENCE
+===============================================================
+
+Problem                          | Fix
+---------------------------------|----------------------------------------------
+Nodes show NotReady              | Calico not ready yet — wait 2-3 mins
+kubelet won't start              | journalctl -u kubelet -f (swap or cgroup issue)
+kubeadm init fails on preflight  | kubeadm init --ignore-preflight-errors=all
+Workers can't join               | Check firewall, port 6443, token expiry (24h)
+Pods stuck in ContainerCreating  | Calico not done — kubectl describe pod <name>
+
+
+===============================================================
+  QUICK REFERENCE COMMANDS
+===============================================================
+
+# Check node status
+kubectl get nodes -o wide
+
+# Check all pods
+kubectl get pods -A
+
+# Check cluster info
+kubectl cluster-info
+
+# Regenerate join token
+kubeadm token create --print-join-command
+
+# Reset a node (if needed to start over)
+kubeadm reset && rm -rf /etc/kubernetes ~/.kube /var/lib/etcd
+
+# View kubelet logs
+journalctl -u kubelet -f
+
+# View containerd status
+systemctl status containerd
+
+
+===============================================================
+  END OF GUIDE
+===============================================================
