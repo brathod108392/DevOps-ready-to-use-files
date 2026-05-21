@@ -1,0 +1,150 @@
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│   K8s Cluster   │      │ Prometheus Server│      │ Grafana Server  │
+│   (target)      │      │ (metrics store)  │      │ (visualization) │
+└─────────────────┘      └─────────────────┘      └─────────────────┘
+      │                          ▲                          ▲
+      └── what scrapes it? ──────┘    what queries it? ────┘
+	  
+	  
+	  
+Architecture 
+
+┌─────────────────────────────────────────────────────────────────┐
+│                        K8s Cluster                              │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              Grafana Alloy (DaemonSet)                  │   │
+│  │  • Scrapes node metrics (replaces Node Exporter)        │   │
+│  │  • Collects container logs  (replaces Promtail)         │   │
+│  │  • Collects K8s events                                  │   │
+│  │  • Auto-discovers pods/services via K8s SD              │   │
+│  └──────────────────────┬──────────────────────────────────┘   │
+│                         │                                       │
+│  ┌──────────────────────▼──────────────────────────────────┐   │
+│  │           kube-state-metrics (Deployment)               │   │
+│  │  • Pod/Deployment/ReplicaSet state metrics              │   │
+│  └──────────────────────┬──────────────────────────────────┘   │
+└─────────────────────────┼───────────────────────────────────────┘
+                          │ remote_write (metrics)
+                          │ push logs
+                          │
+          ┌───────────────┼───────────────┐
+          │               │               │
+   ┌──────▼──────┐ ┌──────▼──────┐       │
+   │ Prometheus  │ │    Loki     │       │
+   │ Server      │ │   Server    │       │
+   │ (:9090)     │ │  (:3100)    │       │
+   └──────┬──────┘ └──────┬──────┘       │
+          │               │              │
+          └───────┬────────┘             │
+                  │                      │
+           ┌──────▼──────┐               │
+           │   Grafana   │◄──────────────┘
+           │   Server    │
+           │  (:3000)    │
+           └─────────────┘
+		   
+		  
+		  
+Component Breakdown — What to Install Where
+
+Inside K8s Cluster (via Helm)
+1. Grafana Alloy — DaemonSet (runs on every node)
+   helm repo add grafana https://grafana.github.io/helm-charts
+   helm install alloy grafana/alloy \
+   --namespace monitoring \
+   --create-namespace \
+   -f alloy-values.yaml
+   
+2. Alloy config for K8s:
+    // Auto-discover and scrape all pods with prometheus annotations
+    discovery.kubernetes "pods" {
+    role = "pod"
+    }
+
+    discovery.relabel "pods" {
+    targets = discovery.kubernetes.pods.targets
+
+    // Only scrape pods with annotation: prometheus.io/scrape=true
+    rule {
+    source_labels = ["__meta_kubernetes_pod_annotation_prometheus_io_scrape"]
+    action        = "keep"
+    regex         = "true"
+    }
+   rule {
+    source_labels = ["__meta_kubernetes_pod_annotation_prometheus_io_port"]
+    action        = "replace"
+    target_label  = "__address__"
+    regex         = "(.+)"
+    replacement   = "${1}"
+     }
+    }
+
+     prometheus.scrape "pods" {
+     targets    = discovery.relabel.pods.output
+     forward_to = [prometheus.remote_write.external.receiver]
+      }
+
+     // Scrape kubelet / cAdvisor (container metrics)
+      prometheus.scrape "kubelet" {
+       targets = [{
+        __address__ = "localhost:10250",
+           job         = "kubelet",
+               }]
+            scheme     = "https"
+           forward_to = [prometheus.remote_write.external.receiver]
+           }
+
+         // Collect all container logs
+          loki.source.kubernetes "pods" {
+          forward_to = [loki.write.external.receiver]
+           }
+
+          // Collect K8s events as logs
+         loki.source.kubernetes_events "events" {
+          forward_to = [loki.write.external.receiver]
+          }
+
+       // Remote write metrics to external Prometheus
+        prometheus.remote_write "external" {
+        endpoint {
+         url = "http://<prometheus-server-ip>:9090/api/v1/write"
+         }
+         }
+
+        // Push logs to external Loki
+         loki.write "external" {
+         endpoint {
+          url = "http://<loki-server-ip>:3100/loki/api/v1/push"
+              }
+           }
+		   
+		 
+3. kube-state-metrics — Deployment (one per cluster)
+   helm install kube-state-metrics prometheus-community/kube-state-metrics \
+   --namespace monitoring
+   
+   
+4. On Prometheus Server (external)
+
+    # In your prometheus systemd service, add this flag (already in your script!)
+    --web.enable-remote-write-receiver
+	
+	Add scrape job for kube-state-metrics:
+	# prometheus.yml
+      scrape_configs:
+        - job_name: 'kube-state-metrics'
+          static_configs:
+             - targets: ['<kube-state-metrics-svc>:8080']
+			 
+			 
+	On Your Grafana Server (external)
+	Add these data sources:
+		Prometheus  →  http://<prometheus-server>:9090
+        Loki        →  http://<loki-server>:3100
+
+
+   
+   
+		
+		
