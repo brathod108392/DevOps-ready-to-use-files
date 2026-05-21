@@ -7,7 +7,7 @@ aws configure
   password
   region name
   format
-ssh-kegen
+  ssh-kegen     #It will use this key for node login/setup.
 
 
 
